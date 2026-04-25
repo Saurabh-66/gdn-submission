@@ -2,110 +2,22 @@
 GDN Prefill Kernel – MLSys 2026 FlashInfer Contest
 Definition: gdn_prefill_qk4_v8_d128_k_last
 
-Proper Triton kernel with runtime tl.range loop.
-- tl.range(0, T_seq, 1) compiles to a normal PTX loop — no unrolling, no hang
-- State S_KV [BK, BV] = [128, 128] lives in registers across the entire loop
-- Zero HBM state traffic during the scan (only q/k/v/g/beta streamed per token)
-- Grid: (num_seqs * HV,) — one CTA per (sequence, head)
+Strategy: pure PyTorch, vectorized over all HV heads simultaneously.
 
-Progress monitoring: kernel writes a counter to a shared tensor after each
-sequence completes, which you can watch from a second terminal.
+The reference has 3 nested Python loops:
+  for seq_idx:        # Python
+    for token i:      # Python
+      for h_idx:      # Python  <-- we eliminate this one
+
+We keep the outer two loops (unavoidable — sequential state dependency)
+but eliminate the innermost head loop entirely by batching all 8 heads
+with PyTorch's bmm/matmul. This gives ~8x+ speedup over the reference
+with zero compilation risk.
 """
 
 import math
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _gdn_prefill_kernel(
-    # inputs [total_T, HV, *]  fp32 (pre-expanded)
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    g_ptr,
-    beta_ptr,
-    # per-sequence offsets: t0[seq], t1[seq]
-    t0_ptr,     # [num_seqs]  int32
-    t1_ptr,     # [num_seqs]  int32
-    # state [N, HV, V, K]  fp32  k-last on disk
-    state_ptr,
-    # output [total_T, HV, V]  bf16
-    out_ptr,
-    # new_state [N, HV, V, K]  fp32
-    ns_ptr,
-    # progress counter [1]  int32  atomic increment per completed CTA
-    progress_ptr,
-    scale,
-    # strides q/k [total_T, HV, K]
-    sq_t, sq_h, sq_k,
-    sk_t, sk_h, sk_k,
-    # strides v [total_T, HV, V]
-    sv_t, sv_h, sv_v,
-    # strides g/beta [total_T, HV]
-    sg_t, sg_h,
-    sbeta_t, sbeta_h,
-    # strides state/ns [N, HV, V, K]
-    ss_n, ss_h, ss_v, ss_k,
-    sn_n, sn_h, sn_v, sn_k,
-    # strides out [total_T, HV, V]
-    so_t, so_h, so_v,
-    # sizes
-    HV:  tl.constexpr,
-    K:   tl.constexpr,
-    V:   tl.constexpr,
-    BK:  tl.constexpr,
-    BV:  tl.constexpr,
-):
-    """Grid: (num_seqs * HV,)"""
-    pid     = tl.program_id(0)
-    seq_idx = pid // HV
-    hv      = pid  % HV
-
-    t0    = tl.load(t0_ptr + seq_idx).to(tl.int32)
-    t1    = tl.load(t1_ptr + seq_idx).to(tl.int32)
-    T_seq = t1 - t0
-
-    rk = tl.arange(0, BK)
-    rv = tl.arange(0, BV)
-    mk = rk < K
-    mv = rv < V
-    ms = mk[:, None] & mv[None, :]
-
-    # Load initial state [V,K] on disk -> S_KV [BK,BV] in registers
-    s_base = state_ptr + seq_idx * ss_n + hv * ss_h
-    s_off  = rk[:, None] * ss_k + rv[None, :] * ss_v
-    S_KV   = tl.load(s_base + s_off, mask=ms, other=0.).to(tl.float32)
-
-    # Sequential scan — runtime loop, compiles to normal PTX loop
-    for i in tl.range(0, T_seq, 1):
-        t = t0 + i
-
-        q    = tl.load(q_ptr    + t*sq_t + hv*sq_h + rk*sq_k, mask=mk, other=0.).to(tl.float32)
-        k    = tl.load(k_ptr    + t*sk_t + hv*sk_h + rk*sk_k, mask=mk, other=0.).to(tl.float32)
-        v    = tl.load(v_ptr    + t*sv_t + hv*sv_h + rv*sv_v, mask=mv, other=0.).to(tl.float32)
-        g    = tl.load(g_ptr    + t*sg_t + hv*sg_h).to(tl.float32)
-        beta = tl.load(beta_ptr + t*sbeta_t + hv*sbeta_h).to(tl.float32)
-
-        old_state = g * S_KV
-        old_v     = tl.sum(k[:, None] * old_state, axis=0)
-        new_v     = beta * v + (1.0 - beta) * old_v
-        delta_v   = new_v - old_v
-        S_KV      = old_state + k[:, None] * delta_v[None, :]
-        o         = scale * tl.sum(q[:, None] * S_KV, axis=0)
-
-        tl.store(out_ptr + t*so_t + hv*so_h + rv*so_v, o.to(tl.bfloat16), mask=mv)
-
-    # Store new state
-    ns_base = ns_ptr + seq_idx * sn_n + hv * sn_h
-    ns_off  = rk[:, None] * sn_k + rv[None, :] * sn_v
-    tl.store(ns_base + ns_off, S_KV, mask=ms)
-
-    # Atomic progress increment (only once per seq, from head 0)
-    if hv == 0:
-        tl.atomic_add(progress_ptr, 1)
 
 
 def kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale,
@@ -137,60 +49,68 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale,
     if isinstance(scale, torch.Tensor):
         scale = float(scale.item())
 
-    # ── precompute g, beta ────────────────────────────────────────────────
+    # ── precompute g, beta for all tokens, all heads ──────────────────────
     x        = a.float() + dt_bias.float()
     g_all    = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [total_T, HV]
     beta_all = torch.sigmoid(b.float())                               # [total_T, HV]
 
-    # ── GQA expansion ────────────────────────────────────────────────────
-    q_exp = q.float().repeat_interleave(GQA, dim=1).contiguous()     # [total_T, HV, K]
-    k_exp = k.float().repeat_interleave(GQA, dim=1).contiguous()     # [total_T, HV, K]
-    v_f   = v.float().contiguous()                                    # [total_T, HV, V]
-    g_all    = g_all.contiguous()
-    beta_all = beta_all.contiguous()
+    # ── GQA expansion: q,k from HQ heads -> HV heads ─────────────────────
+    q_exp = q.float().repeat_interleave(GQA, dim=1)   # [total_T, HV, K]
+    k_exp = k.float().repeat_interleave(GQA, dim=1)   # [total_T, HV, K]
+    v_f   = v.float()                                  # [total_T, HV, V]
 
     if state is None:
-        state = torch.zeros(num_seqs, HV, V, K, dtype=torch.float32, device=dev)
-    state = state.contiguous()
+        state_f = torch.zeros(num_seqs, HV, V, K, dtype=torch.float32, device=dev)
+    else:
+        state_f = state.float()
 
-    # ── build t0, t1 arrays ───────────────────────────────────────────────
-    cu = cu_seqlens.to(torch.int32)
-    t0_arr = cu[:-1].contiguous()   # [num_seqs]
-    t1_arr = cu[1: ].contiguous()   # [num_seqs]
+    # ── process each sequence ─────────────────────────────────────────────
+    for seq_idx in range(num_seqs):
+        t0    = int(cu_seqlens[seq_idx].item())
+        t1    = int(cu_seqlens[seq_idx + 1].item())
+        T_seq = t1 - t0
+        if T_seq <= 0:
+            new_state[seq_idx] = state_f[seq_idx]
+            continue
 
-    # ── progress counter ──────────────────────────────────────────────────
-    progress = torch.zeros(1, dtype=torch.int32, device=dev)
+        # State: [HV, V, K] k-last on disk -> work as S_KV [HV, K, V]
+        S_KV = state_f[seq_idx].transpose(-1, -2).clone()  # [HV, K, V]
 
-    BK = triton.next_power_of_2(K)
-    BV = triton.next_power_of_2(V)
+        q_s    = q_exp[t0:t1]    # [T_seq, HV, K]
+        k_s    = k_exp[t0:t1]    # [T_seq, HV, K]
+        v_s    = v_f  [t0:t1]    # [T_seq, HV, V]
+        g_s    = g_all  [t0:t1]  # [T_seq, HV]
+        beta_s = beta_all[t0:t1] # [T_seq, HV]
 
-    grid = (num_seqs * HV,)
+        # Sequential token scan, vectorized over HV heads
+        for i in range(T_seq):
+            g_i    = g_s[i]      # [HV]
+            beta_i = beta_s[i]   # [HV]
+            k_i    = k_s[i]      # [HV, K]
+            v_i    = v_s[i]      # [HV, V]
+            q_i    = q_s[i]      # [HV, K]
 
-    _gdn_prefill_kernel[grid](
-        q_exp, k_exp, v_f, g_all, beta_all,
-        t0_arr, t1_arr,
-        state, output, new_state,
-        progress,
-        scale,
-        # q strides [total_T, HV, K]
-        q_exp.stride(0), q_exp.stride(1), q_exp.stride(2),
-        # k strides
-        k_exp.stride(0), k_exp.stride(1), k_exp.stride(2),
-        # v strides [total_T, HV, V]
-        v_f.stride(0), v_f.stride(1), v_f.stride(2),
-        # g strides [total_T, HV]
-        g_all.stride(0), g_all.stride(1),
-        # beta strides
-        beta_all.stride(0), beta_all.stride(1),
-        # state strides [N, HV, V, K]
-        state.stride(0), state.stride(1), state.stride(2), state.stride(3),
-        # new_state strides
-        new_state.stride(0), new_state.stride(1), new_state.stride(2), new_state.stride(3),
-        # output strides [total_T, HV, V]
-        output.stride(0), output.stride(1), output.stride(2),
-        HV=HV, K=K, V=V, BK=BK, BV=BV,
-        num_warps=4,
-        num_stages=2,
-    )
+            # old_state = g * S_KV  [HV, K, V]
+            old_state = g_i[:, None, None] * S_KV
+
+            # old_v = k @ old_state  [HV, V]
+            # [HV, 1, K] @ [HV, K, V] -> [HV, 1, V] -> [HV, V]
+            old_v = (k_i.unsqueeze(1) @ old_state).squeeze(1)
+
+            # new_v = beta*v + (1-beta)*old_v  [HV, V]
+            new_v = beta_i[:, None] * v_i + (1.0 - beta_i[:, None]) * old_v
+
+            # S_KV = old_state + k^T ⊗ (new_v - old_v)  [HV, K, V]
+            # [HV, K, 1] * [HV, 1, V]
+            S_KV = old_state + k_i.unsqueeze(2) * (new_v - old_v).unsqueeze(1)
+
+            # output = scale * q @ S_KV  [HV, V]
+            # [HV, 1, K] @ [HV, K, V] -> [HV, 1, V] -> [HV, V]
+            o_i = scale * (q_i.unsqueeze(1) @ S_KV).squeeze(1)
+
+            output[t0 + i] = o_i.to(torch.bfloat16)
+
+        # Store new state [HV, K, V] -> [HV, V, K] k-last
+        new_state[seq_idx] = S_KV.transpose(-1, -2)
 
     return output, new_state
