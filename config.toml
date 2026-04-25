@@ -1,8 +1,8 @@
 [solution]
-name = "ELOTracker-solution-v2"      # Solution name
-definition = "gdn_decode_qk4_v8_d128_k_last"          # Track: fused_moe | sparse_attention | gated_delta_net
+name = "ELOTracker-solution-v4"      # Solution name
+definition = "gdn_prefill_qk4_v8_d128_k_last"          # Track: fused_moe | sparse_attention | gated_delta_net
 author = "ELOTracker"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
-entry_point = "kernel.py::kernel"            # Kernel function name
+entry_point = "kernel1.py::kernel"            # Kernel function name
