@@ -1,5 +1,5 @@
 [solution]
-name = "ELOTracker-solution-v4"      # Solution name
+name = "ELOTracker-solution-v5"      # Solution name
 definition = "gdn_prefill_qk4_v8_d128_k_last"          # Track: fused_moe | sparse_attention | gated_delta_net
 author = "ELOTracker"              # Team/author name
 
